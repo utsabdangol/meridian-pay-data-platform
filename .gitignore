@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Environment variables
+.env
+
+# IDE files
+.vscode/
+.idea/
+
+# Local data and Spark output
+warehouse/
+data/processed/
+spark-warehouse/
+metastore_db/
+
+# Logs
+*.log
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
