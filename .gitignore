@@ -16,6 +16,9 @@ warehouse/
 data/processed/
 spark-warehouse/
 metastore_db/
+docker-spark-iceberg/data/
+docker-spark-iceberg/warehouse/
+hadoopbinwinutils.exe
 
 # Logs
 *.log
