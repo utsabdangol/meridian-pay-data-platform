@@ -13,6 +13,7 @@ __pycache__/
 
 # Local data and Spark output
 warehouse/
+data/events/
 data/processed/
 spark-warehouse/
 metastore_db/

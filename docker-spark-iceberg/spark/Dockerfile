@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 # syntax=docker/dockerfile:1
-FROM python:3.10-bullseye
+FROM python:3.10-bookworm
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -87,7 +87,7 @@ RUN mkdir -p /home/iceberg/data \
  && curl https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-05.parquet -o /home/iceberg/data/yellow_tripdata_2021-05.parquet \
  && curl https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2021-04.parquet -o /home/iceberg/data/yellow_tripdata_2021-04.parquet
 
-RUN mkdir -p /home/iceberg/localwarehouse /home/iceberg/notebooks /home/iceberg/warehouse /home/iceberg/spark-events /home/iceberg
+RUN mkdir -p /home/iceberg/localwarehouse /home/iceberg/notebooks /home/iceberg/warehouse /home/iceberg/spark-events /home/iceberg /home/iceberg/jobs
 COPY notebooks/ /home/iceberg/notebooks
 
 # Add a notebook command

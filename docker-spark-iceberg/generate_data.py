@@ -1,12 +1,16 @@
 """
-Transaction Data Generator for Meridian Pay Data Platform.
+Generates synthetic daily transaction event files for the payments lakehouse
+project. Simulates three kinds of traffic:
+  - normal same-day events (~85%)
+  - corrections referencing a transaction from 1-3 days earlier (~10%)
+  - processing-lag events, reported a day or two after they happened (~5%)
 
-Generates 30 days of simulated transaction data in JSONL format with:
-- ~500 to 1000 transactions per day
-- ~10% corrections/refunds referencing transactions from 1-3 days prior
-- ~5% processing-lag events (event timestamp earlier than ingestion timestamp)
-- Schema evolution on Day 20+: introduction of BANK_TRANSFER_INSTANT with
-  `clearing_house_ref` and `instant_settlement_flag` fields.
+From SCHEMA_EVOLUTION_DAY onward, a new payment rail (BANK_TRANSFER_INSTANT)
+appears with two extra fields — this is the schema evolution moment for
+Iceberg's ALTER TABLE ADD COLUMN to handle.
+
+Output: one JSONL file per day, partitioned by ingestion date, written to
+./data/events/dt=YYYY-MM-DD/events_YYYY-MM-DD.jsonl
 """
 
 import json
@@ -15,101 +19,147 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from faker import Faker
 
-START_DATE = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
-DAYS = 30
+fake = Faker()
+random.seed(42)
+Faker.seed(42)
 
-BASE_RAILS = ["CREDIT_CARD", "DEBIT_CARD", "ACH", "PAYPAL"]
-MERCHANTS = [f"mch_{i:03d}" for i in range(1, 26)]
-CURRENCIES = ["USD", "USD", "USD", "EUR", "GBP"]
-EVENT_TYPES = ["PAYMENT", "REFUND", "CORRECTION", "CHARGEBACK"]
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "data", "events")
+NUM_DAYS = 30
+BASE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+DAILY_TX_MIN, DAILY_TX_MAX = 500, 1000
+CORRECTION_RATE = 0.10
+LAG_RATE = 0.05
+SCHEMA_EVOLUTION_DAY = 20  # day index (0-based) when the new payment rail launches
 
-def generate_dataset():
-    random.seed(42)
-    history = {}  # day_num -> list of transaction_ids
+MERCHANTS = [f"m-{i:04d}" for i in range(1, 201)]
+CUSTOMERS = [f"c-{i:05d}" for i in range(1, 5001)]
 
-    total_records = 0
-    print(f"Generating 30 days of dataset into {OUTPUT_DIR}...")
+PAYMENT_METHODS = ["WALLET_BALANCE", "CARD", "BANK_TRANSFER"]
+NEW_PAYMENT_METHOD = "BANK_TRANSFER_INSTANT"
 
-    for day in range(1, DAYS + 1):
-        day_date = START_DATE + timedelta(days=day - 1)
-        daily_tx_count = random.randint(500, 1000)
-        daily_records = []
-        day_tx_ids = []
+STATUS_FOR_EVENT = {
+    "INITIATED": "INITIATED",
+    "COMPLETED": "COMPLETED",
+    "FAILED": "FAILED",
+    "REFUNDED": "REFUNDED",
+    "CHARGEBACK": "CHARGEBACK",
+}
 
-        for _ in range(daily_tx_count):
-            tx_id = f"tx_{uuid.uuid4().hex[:12]}"
-            day_tx_ids.append(tx_id)
 
-            # Determine event time & ingestion time (handling ~5% lag)
-            is_lagged = random.random() < 0.05
-            if is_lagged and day > 2:
-                lag_days = random.randint(1, 2)
-                event_time = day_date - timedelta(days=lag_days, seconds=random.randint(0, 86400))
+def new_transaction_id():
+    return f"t-{uuid.uuid4().hex[:12]}"
+
+
+def new_event_id():
+    return f"e-{uuid.uuid4().hex[:12]}"
+
+
+def make_event(transaction_id, event_type, event_timestamp, ingested_at, payment_method, day_index):
+    event = {
+        "event_id": new_event_id(),
+        "transaction_id": transaction_id,
+        "event_type": event_type,
+        "event_timestamp": event_timestamp.isoformat(),
+        "ingested_at": ingested_at.isoformat(),
+        "merchant_id": random.choice(MERCHANTS),
+        "customer_id": random.choice(CUSTOMERS),
+        "amount": round(random.uniform(50, 15000), 2),
+        "currency": "NPR",
+        "payment_method": payment_method,
+        "status": STATUS_FOR_EVENT[event_type],
+    }
+    # Schema evolution: these fields only exist once the new rail launches,
+    # and only on events that actually use it.
+    if day_index >= SCHEMA_EVOLUTION_DAY and payment_method == NEW_PAYMENT_METHOD:
+        event["bank_reference_number"] = fake.bban()
+        event["routing_details"] = fake.swift8()
+    return event
+
+
+def write_day(day_index, events):
+    day_date = (BASE_DATE + timedelta(days=day_index)).date().isoformat()
+    day_dir = os.path.join(OUTPUT_DIR, f"dt={day_date}")
+    os.makedirs(day_dir, exist_ok=True)
+    path = os.path.join(day_dir, f"events_{day_date}.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for event in events:
+            f.write(json.dumps(event) + "\n")
+    print(f"Day {day_index} ({day_date}): wrote {len(events)} events -> {path}")
+
+
+def main():
+    # Pool of recently-completed transactions eligible for a late correction.
+    # {transaction_id: day_index_completed}
+    recent_transactions = {}
+
+    for day_index in range(NUM_DAYS):
+        day_date = BASE_DATE + timedelta(days=day_index)
+        events = []
+        daily_count = random.randint(DAILY_TX_MIN, DAILY_TX_MAX)
+
+        available_methods = PAYMENT_METHODS + (
+            [NEW_PAYMENT_METHOD] if day_index >= SCHEMA_EVOLUTION_DAY else []
+        )
+
+        for _ in range(daily_count):
+            roll = random.random()
+
+            # --- Correction event: references an existing transaction ---
+            if roll < CORRECTION_RATE and recent_transactions:
+                candidates = [
+                    tx for tx, created_day in recent_transactions.items()
+                    if 1 <= day_index - created_day <= 3
+                ]
+                if candidates:
+                    transaction_id = random.choice(candidates)
+                    event_type = random.choice(["REFUNDED", "CHARGEBACK", "FAILED"])
+                    event_ts = day_date + timedelta(
+                        hours=random.randint(0, 23), minutes=random.randint(0, 59)
+                    )
+                    events.append(make_event(
+                        transaction_id, event_type, event_ts, event_ts,
+                        random.choice(available_methods), day_index,
+                    ))
+                    continue  # correction doesn't create a new transaction_id
+
+            # --- New transaction: normal traffic or processing lag ---
+            transaction_id = new_transaction_id()
+            payment_method = random.choice(available_methods)
+
+            if roll < CORRECTION_RATE + LAG_RATE:
+                # Processing lag: happened 1-2 days before it was reported
+                event_ts = day_date - timedelta(days=random.randint(1, 2))
+                ingested_ts = day_date + timedelta(
+                    hours=random.randint(0, 23), minutes=random.randint(0, 59)
+                )
             else:
-                event_time = day_date + timedelta(seconds=random.randint(0, 86400))
+                # Normal same-day traffic
+                event_ts = day_date + timedelta(
+                    hours=random.randint(0, 23), minutes=random.randint(0, 59)
+                )
+                ingested_ts = event_ts
 
-            ingestion_time = day_date + timedelta(seconds=random.randint(0, 86400))
-            if ingestion_time < event_time:
-                ingestion_time = event_time + timedelta(seconds=random.randint(5, 300))
+            event_type = random.choices(
+                ["INITIATED", "COMPLETED", "FAILED"], weights=[0.1, 0.85, 0.05]
+            )[0]
 
-            # Determine event type & reference transaction (~10% corrections)
-            is_correction = random.random() < 0.10
-            ref_tx_id = None
-            if is_correction and day > 1:
-                # Pick a transaction from 1 to 3 days ago
-                lookback_days = random.randint(1, min(3, day - 1))
-                target_day = day - lookback_days
-                if history.get(target_day):
-                    ref_tx_id = random.choice(history[target_day])
-                    event_type = random.choice(["REFUND", "CORRECTION", "CHARGEBACK"])
-                else:
-                    event_type = "PAYMENT"
-            else:
-                event_type = "PAYMENT"
+            events.append(make_event(
+                transaction_id, event_type, event_ts, ingested_ts, payment_method, day_index
+            ))
 
-            # Payment rail selection (Day 20+ includes BANK_TRANSFER_INSTANT)
-            if day >= 20 and random.random() < 0.15:
-                payment_rail = "BANK_TRANSFER_INSTANT"
-            else:
-                payment_rail = random.choice(BASE_RAILS)
+            if event_type == "COMPLETED":
+                recent_transactions[transaction_id] = day_index
 
-            # Base Record
-            record = {
-                "transaction_id": tx_id,
-                "event_timestamp": event_time.isoformat(),
-                "ingestion_timestamp": ingestion_time.isoformat(),
-                "merchant_id": random.choice(MERCHANTS),
-                "customer_id": f"cust_{random.randint(100, 999)}",
-                "amount": round(random.uniform(5.0, 1250.0), 2),
-                "currency": random.choice(CURRENCIES),
-                "payment_rail": payment_rail,
-                "event_type": event_type,
-                "reference_transaction_id": ref_tx_id,
-                "status": "SUCCESS" if random.random() > 0.03 else "FAILED"
-            }
+        write_day(day_index, events)
 
-            # Schema Evolution fields for BANK_TRANSFER_INSTANT on Day 20+
-            if payment_rail == "BANK_TRANSFER_INSTANT":
-                record["clearing_house_ref"] = f"CH-{random.randint(1000000, 9999999)}"
-                record["instant_settlement_flag"] = True
+        # Keep the correction pool bounded to the last 5 days
+        recent_transactions = {
+            tx: d for tx, d in recent_transactions.items() if day_index - d <= 5
+        }
 
-            daily_records.append(record)
-
-        history[day] = day_tx_ids
-
-        # Write to JSONL
-        file_path = os.path.join(OUTPUT_DIR, f"transactions_day_{day:02d}.jsonl")
-        with open(file_path, "w", encoding="utf-8") as f:
-            for rec in daily_records:
-                f.write(json.dumps(rec) + "\n")
-
-        total_records += len(daily_records)
-        print(f"  Day {day:02d}: Generated {len(daily_records)} records -> {os.path.basename(file_path)}")
-
-    print(f"\nDone! Generated {total_records} total transactions across 30 days.")
 
 if __name__ == "__main__":
-    generate_dataset()
+    main()
