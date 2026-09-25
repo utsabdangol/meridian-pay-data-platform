@@ -117,6 +117,7 @@ RUN chmod u+x /opt/spark/sbin/* && \
 COPY .pyiceberg.yaml /root/.pyiceberg.yaml
 
 COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 ENTRYPOINT ["./entrypoint.sh"]
 CMD ["notebook"]

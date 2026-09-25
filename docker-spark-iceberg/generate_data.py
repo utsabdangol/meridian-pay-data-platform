@@ -19,6 +19,8 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 
+
+# pyrefly: ignore [missing-import]
 from faker import Faker
 
 fake = Faker()
