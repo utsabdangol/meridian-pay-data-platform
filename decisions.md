@@ -176,7 +176,43 @@ persistent, shared catalog (e.g. AWS Glue) so both engines see updates
 automatically, without a manual pointer-update step. This was a deliberate
 scope reduction for the POC, not an oversight.
 
-## 9. Known limitations / what a production version would change
+## 9. Snowflake Time Travel's registration boundary
+
+While testing the audit/dispute-resolution query (reconstructing a
+transaction's state before a correction), Snowflake's native `AT`/`BEFORE`
+time travel consistently failed with "before object creation time" for
+every timestamp inside the simulated 30-day data window — even though the
+underlying Iceberg `metadata.json` genuinely records a full `snapshot-log`
+going back to day one.
+
+**Root cause:** Snowflake's Time Travel only covers snapshots created *after*
+the table is registered as a Snowflake object (`CREATE ICEBERG TABLE`). All
+30 days of history had been loaded via Spark, in bulk, before the table was
+ever registered in Snowflake — so the entire pre-registration period sat
+outside Time Travel's reachable window, regardless of what the metadata
+file itself recorded. This is a Snowflake feature-scope limitation, not a
+data-loss or Iceberg limitation: the timestamps were real and correct the
+whole time.
+
+**Worked around by** creating a new correction *after* registration (an
+`UPDATE` on a live transaction) and comparing the static `METADATA_FILE_PATH`
+pointer's state before vs. after re-pointing it at the new snapshot — which
+incidentally demonstrates the exact static-pointer mechanism from section 8
+rather than working around it.
+
+**The actual fix, for any future iteration:** this gap is a consequence of
+doing one large retroactive backfill before ever registering the table in
+Snowflake — not an inherent Iceberg/Snowflake limitation. Registering the
+table immediately after the *first* day's Spark commit, and refreshing the
+pointer continuously as each subsequent day lands (rather than loading 30
+days first and registering once, afterward), would keep nearly the entire
+history inside Snowflake's tracked window from the start. This is a second,
+independent reason (beyond convenience) that a production setup should use
+an auto-refreshing catalog integration rather than a manually-updated static
+pointer: it keeps Snowflake's registration continuously current with Spark's
+writes, rather than accumulating a large gap between them.
+
+## 10. Known limitations / what a production version would change
 
 - Persistent (not in-memory) REST catalog, or AWS Glue as the shared catalog
 - Automatic metadata refresh on the Snowflake side, instead of a static
@@ -187,3 +223,7 @@ scope reduction for the POC, not an oversight.
   constraints are resolved
 - Data-quality checks (row-count assertions, no-duplicate-key checks) as
   automated tests rather than ad hoc manual verification queries
+- Register the Snowflake Iceberg Table immediately after the first data load
+  and refresh it continuously, rather than bulk-loading history first and
+  registering once afterward — keeps Time Travel's reachable window aligned
+  with Spark's actual write history (see section 9)
